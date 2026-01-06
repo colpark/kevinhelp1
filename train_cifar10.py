@@ -142,13 +142,13 @@ def parse_args():
     parser.add_argument("--num_classes", type=int, default=10)
     parser.add_argument("--image_size", type=int, default=32)
 
-    # Model config
-    parser.add_argument("--hidden_size", type=int, default=512)
+    # Model config (smaller defaults for CIFAR-10 32x32)
+    parser.add_argument("--hidden_size", type=int, default=256, help="Transformer hidden size")
     parser.add_argument("--decoder_hidden_size", type=int, default=64)
-    parser.add_argument("--num_encoder_blocks", type=int, default=8)
+    parser.add_argument("--num_encoder_blocks", type=int, default=4, help="Number of DiT encoder blocks")
     parser.add_argument("--num_decoder_blocks", type=int, default=2)
-    parser.add_argument("--patch_size", type=int, default=8)
-    parser.add_argument("--num_groups", type=int, default=8)
+    parser.add_argument("--patch_size", type=int, default=4, help="Patch size (4 for 32x32 gives 64 patches)")
+    parser.add_argument("--num_groups", type=int, default=4, help="Number of attention heads")
 
     # Sampler config
     parser.add_argument("--guidance", type=float, default=2.0)
@@ -451,6 +451,9 @@ def build_datamodule(args):
 
 def main():
     args = parse_args()
+
+    # Enable tensor core optimization for H100/A100
+    torch.set_float32_matmul_precision('high')
 
     print("=" * 60)
     print("CIFAR-10 Class-Conditional Training with Heavy Decoder")

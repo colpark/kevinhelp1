@@ -223,18 +223,24 @@ class LearnableFourierMLP(nn.Module):
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         """
-        coords: (N,2)
-        returns: (N,out_features)
+        coords: (N, 2) or (B, L, 2)
+        returns: (N, out_features) or (B, L, out_features)
         """
         orig_dtype = coords.dtype
-        coords_f = coords.to(dtype=torch.float32)
+        orig_shape = coords.shape[:-1]  # Everything except last dim (which is 2)
 
-        # (N,2) -> (N,2,n_bands)
-        proj = coords_f.unsqueeze(-1) * self.freqs.view(1, 1, -1)
-        # (N,2,n_bands) -> (N,2,2*n_bands) -> (N,4*n_bands)
-        fourier = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1).reshape(coords.shape[0], -1)
+        # Flatten to (N, 2) for processing
+        coords_flat = coords.reshape(-1, 2).to(dtype=torch.float32)
+
+        # (N, 2) -> (N, 2, n_bands)
+        proj = coords_flat.unsqueeze(-1) * self.freqs.view(1, 1, -1)
+        # (N, 2, n_bands) -> (N, 2, 2*n_bands) -> (N, 4*n_bands)
+        fourier = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1).reshape(coords_flat.shape[0], -1)
 
         out = self.mlp(fourier)
+
+        # Reshape back to original batch structure
+        out = out.reshape(*orig_shape, self.out_features)
         return out.to(dtype=orig_dtype)
 
 
