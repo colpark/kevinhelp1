@@ -57,6 +57,66 @@ from src.lightning_data import DataModule
 from src.data.dataset.cifar10 import PixCIFAR10, CIFAR10RandomNDataset
 
 
+class SparseLightningModel(LightningModel):
+    """
+    Custom LightningModel that generates sparse conditioning masks during training.
+
+    For SFC encoder training, we need to:
+    1. Generate random sparse masks for each batch
+    2. Pass the masks to the denoiser via metadata
+    """
+    def __init__(self, *args, sparsity: float = 0.4, cond_fraction: float = 0.5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sparsity = sparsity
+        self.cond_fraction = cond_fraction
+
+    def _generate_sparse_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Generate sparse conditioning mask.
+
+        Args:
+            x: (B, C, H, W) input tensor
+
+        Returns:
+            cond_mask: (B, 1, H, W) binary mask where 1 = observed pixel
+        """
+        B, C, H, W = x.shape
+        device = x.device
+
+        # Total pixels to keep (sparse observation)
+        total_keep = int(self.sparsity * H * W)
+
+        # Generate random mask for each sample in batch
+        cond_mask = torch.zeros(B, 1, H, W, device=device)
+
+        for b in range(B):
+            # Random pixel indices to keep
+            indices = torch.randperm(H * W, device=device)[:total_keep]
+            mask_flat = torch.zeros(H * W, device=device)
+            mask_flat[indices] = 1.0
+            cond_mask[b, 0] = mask_flat.view(H, W)
+
+        return cond_mask
+
+    def training_step(self, batch, batch_idx):
+        x, y, metadata = batch
+
+        with torch.no_grad():
+            x = self.vae.encode(x)
+            condition, uncondition = self.conditioner(y, metadata)
+
+            # Generate sparse mask for SFC encoder
+            cond_mask = self._generate_sparse_mask(x)
+            metadata['cond_mask'] = cond_mask
+
+        loss = self.diffusion_trainer(
+            self.denoiser, self.ema_denoiser, self.diffusion_sampler,
+            x, condition, uncondition, metadata
+        )
+        self.log_dict(loss, prog_bar=True, on_step=True, sync_dist=False)
+        return loss["loss"]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CIFAR-10 class-conditional model")
 
@@ -341,7 +401,7 @@ def build_model(args):
     ema_tracker = SimpleEMA(decay=0.9999)
     optimizer = partial(torch.optim.AdamW, lr=args.lr, weight_decay=0.0)
 
-    model = LightningModel(
+    model = SparseLightningModel(
         vae=vae,
         conditioner=conditioner,
         denoiser=denoiser,
