@@ -9,6 +9,8 @@ Key differences from T2I heavy decoder:
 - No TextRefineBlocks (class labels don't need refinement)
 - Supports num_classes for CIFAR-10 (10) or ImageNet (1000)
 """
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -206,7 +208,7 @@ class SFCTransformerBlock(nn.Module):
         self.mlp = FeedForward(dim, mlp_hidden)
         self.drop2 = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, token_mask: torch.Tensor | None):
+    def forward(self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None):
         """
         x: (B,T,D)
         token_mask: (B,T) bool, True=real token, False=pad
