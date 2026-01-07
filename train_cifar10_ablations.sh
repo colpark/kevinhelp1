@@ -28,7 +28,7 @@ COMMON_ARGS="
     --sfc_curve hilbert
     --sfc_group_size 8
     --sfc_cross_depth 2
-    --max_steps 100000
+    --max_steps 300000
     --batch_size 128
     --lr 1e-4
     --hidden_size 512
