@@ -346,17 +346,60 @@ class SparseReconProgressCallback(Callback):
         mask_expanded = mask_vis.expand_as(images)
         sparse_input = sparse_input * mask_expanded
 
+        # 3. Super-resolution to 128x128
+        scale = self.superres_factor
+        H_hr = self.base_res * scale
+        W_hr = self.base_res * scale
+
+        # Create HR tensors with 32x32 hints at stride positions
+        cond_mask_hr = torch.zeros((B, 1, H_hr, W_hr), device=device, dtype=x_latent.dtype)
+        cond_mask_hr[:, :, ::scale, ::scale] = cond_mask
+
+        x_cond_hr = torch.zeros((B, x_latent.shape[1], H_hr, W_hr), device=device, dtype=x_latent.dtype)
+        x_cond_hr[:, :, ::scale, ::scale] = x_latent
+
+        # Temporarily modify decoder_patch_scaling
+        old_scales = {}
+        for name, net in [("denoiser", pl_module.denoiser), ("ema_denoiser", pl_module.ema_denoiser)]:
+            if hasattr(net, "decoder_patch_scaling_h"):
+                old_scales[name] = (net.decoder_patch_scaling_h, net.decoder_patch_scaling_w)
+                net.decoder_patch_scaling_h = scale
+                net.decoder_patch_scaling_w = scale
+
+        # Run diffusion at high resolution
+        noise_hr = torch.randn_like(x_cond_hr)
+        samples_hr = pl_module.diffusion_sampler(
+            pl_module.ema_denoiser,
+            noise_hr,
+            condition,
+            uncondition,
+            cond_mask=cond_mask_hr,
+            x_cond=x_cond_hr,
+        )
+        if isinstance(samples_hr, tuple):
+            samples_hr = samples_hr[0][-1]
+        samples_hr = pl_module.vae.decode(samples_hr)
+
+        # Restore original decoder_patch_scaling
+        for name, net in [("denoiser", pl_module.denoiser), ("ema_denoiser", pl_module.ema_denoiser)]:
+            if name in old_scales:
+                h, w = old_scales[name]
+                net.decoder_patch_scaling_h = h
+                net.decoder_patch_scaling_w = w
+
         # Save all visualizations
         self._save_grid(images, self.progress_dir / f"{tag}_1_gt.png")
         self._save_grid(sparse_input, self.progress_dir / f"{tag}_2_sparse_input.png")
         self._save_grid(samples_class_only, self.progress_dir / f"{tag}_3_class_only.png")
         self._save_grid(samples_sparse_cond, self.progress_dir / f"{tag}_4_sparse_conditioned.png")
+        self._save_grid(samples_hr, self.progress_dir / f"{tag}_5_superres_{H_hr}x{W_hr}.png")
 
         print(f"\n[Step {step}] Saved visualizations to {self.progress_dir}")
-        print(f"  - 1_gt.png: Ground truth images")
+        print(f"  - 1_gt.png: Ground truth images ({self.base_res}x{self.base_res})")
         print(f"  - 2_sparse_input.png: Sparse input (observed pixels only)")
         print(f"  - 3_class_only.png: Class-conditional (no sparse hints)")
         print(f"  - 4_sparse_conditioned.png: Sparse-conditioned reconstruction")
+        print(f"  - 5_superres_{H_hr}x{W_hr}.png: Super-resolution ({scale}x upscale)")
 
         if was_training:
             pl_module.train()
