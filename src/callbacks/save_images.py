@@ -2,7 +2,9 @@ import lightning.pytorch as pl
 from lightning.pytorch import Callback
 
 
+import os
 import os.path
+import shutil
 import numpy
 from typing import Sequence, Any, Dict
 from concurrent.futures import ThreadPoolExecutor
@@ -21,11 +23,10 @@ class SaveImagesHook(Callback):
         self.samples = []
         self.target_dir = target_dir
         self.executor_pool = ThreadPoolExecutor(max_workers=8)
-        if not os.path.exists(self.target_dir):
-            os.makedirs(self.target_dir, exist_ok=True)
-        else:
-            if os.listdir(target_dir) and "debug" not in str(target_dir):
-                raise FileExistsError(f'{self.target_dir} already exists and not empty!')
+        if os.path.exists(self.target_dir) and os.listdir(target_dir):
+            # Clear existing directory (common when resuming training)
+            shutil.rmtree(self.target_dir)
+        os.makedirs(self.target_dir, exist_ok=True)
         rank_zero_info(f"Save images to {self.target_dir}")
         self._saved_num = 0
 
