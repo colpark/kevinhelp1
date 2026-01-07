@@ -49,7 +49,24 @@ class FlowMatchingTrainer(BaseTrainer):
 
         x_t = alpha * x + noise * sigma
         v_t = dalpha * x + dsigma * noise
-        out = net(x_t, t, y)
+
+        # Extract cond_mask from metadata for sparse conditioning
+        cond_mask = None
+        x_cond = None
+        if metadata is not None:
+            cond_mask = metadata.get('cond_mask', None)
+            x_cond = metadata.get('x_cond', None)
+
+        # For sparse conditioning: keep clean values at hint locations (repaint-style)
+        # The model encoder extracts information from hint pixels
+        if cond_mask is not None and x_cond is not None:
+            # At cond_mask=1: use clean x_cond values (for hint tokens)
+            # At cond_mask=0: use noisy x_t
+            x_input = x_t * (1 - cond_mask) + x_cond * cond_mask
+        else:
+            x_input = x_t
+
+        out = net(x_input, t, y, cond_mask=cond_mask)
 
         weight = self.loss_weight_fn(alpha, sigma)
 

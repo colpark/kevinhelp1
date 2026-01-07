@@ -118,6 +118,9 @@ class SparseLightningModel(LightningModel):
             # Generate sparse mask for SFC encoder
             cond_mask = self._generate_sparse_mask(x)
             metadata['cond_mask'] = cond_mask
+            # Store clean latent values for repaint-style conditioning
+            # The trainer will use these at hint locations during training
+            metadata['x_cond'] = x.clone()
 
         loss = self.diffusion_trainer(
             self.denoiser, self.ema_denoiser, self.diffusion_sampler,
@@ -298,37 +301,62 @@ class SparseReconProgressCallback(Callback):
         pl_module.eval()
 
         # Get latent representation and generate sparse mask for visualization
-        x_latent_32 = pl_module.vae.encode(images)
-        cond_mask_32, _ = pl_module._make_sparsity_masks(x_latent_32)
+        x_latent = pl_module.vae.encode(images)
+        cond_mask, _ = pl_module._make_sparsity_masks(x_latent)
 
         condition, uncondition = pl_module.conditioner(labels)
 
-        # Class-conditional generation (standard diffusion sampling)
-        noise_32 = torch.randn_like(x_latent_32)
-        samples_latent_32 = pl_module.diffusion_sampler(
+        # 1. Class-conditional generation (NO sparse conditioning - baseline)
+        noise = torch.randn_like(x_latent)
+        samples_class_only = pl_module.diffusion_sampler(
             pl_module.ema_denoiser,
-            noise_32,
+            noise,
             condition,
             uncondition,
         )
-        # Handle tuple return (x_trajs, v_trajs) from sampler
-        if isinstance(samples_latent_32, tuple):
-            samples_latent_32 = samples_latent_32[0][-1]  # Get final x from trajectory
-        samples_32 = pl_module.vae.decode(samples_latent_32)
+        if isinstance(samples_class_only, tuple):
+            samples_class_only = samples_class_only[0][-1]
+        samples_class_only = pl_module.vae.decode(samples_class_only)
+
+        # 2. Sparse-conditioned reconstruction (WITH sparse conditioning)
+        # This uses the clean latent values at hint locations to guide generation
+        noise = torch.randn_like(x_latent)
+        samples_sparse_cond = pl_module.diffusion_sampler(
+            pl_module.ema_denoiser,
+            noise,
+            condition,
+            uncondition,
+            cond_mask=cond_mask,
+            x_cond=x_latent,  # Clean latent values at hint locations
+        )
+        if isinstance(samples_sparse_cond, tuple):
+            samples_sparse_cond = samples_sparse_cond[0][-1]
+        samples_sparse_cond = pl_module.vae.decode(samples_sparse_cond)
 
         step = trainer.global_step
         tag = f"step_{step:06d}"
 
         # Create sparse input visualization (ground truth with unobserved pixels blacked out)
         sparse_input = images.clone()
-        mask_expanded = cond_mask_32.expand_as(images)
+        # Upsample mask to image resolution if needed (for latent-space masks)
+        if cond_mask.shape[-2:] != images.shape[-2:]:
+            mask_vis = F.interpolate(cond_mask, size=images.shape[-2:], mode='nearest')
+        else:
+            mask_vis = cond_mask
+        mask_expanded = mask_vis.expand_as(images)
         sparse_input = sparse_input * mask_expanded
 
+        # Save all visualizations
         self._save_grid(images, self.progress_dir / f"{tag}_1_gt.png")
         self._save_grid(sparse_input, self.progress_dir / f"{tag}_2_sparse_input.png")
-        self._save_grid(samples_32, self.progress_dir / f"{tag}_3_samples.png")
+        self._save_grid(samples_class_only, self.progress_dir / f"{tag}_3_class_only.png")
+        self._save_grid(samples_sparse_cond, self.progress_dir / f"{tag}_4_sparse_conditioned.png")
 
         print(f"\n[Step {step}] Saved visualizations to {self.progress_dir}")
+        print(f"  - 1_gt.png: Ground truth images")
+        print(f"  - 2_sparse_input.png: Sparse input (observed pixels only)")
+        print(f"  - 3_class_only.png: Class-conditional (no sparse hints)")
+        print(f"  - 4_sparse_conditioned.png: Sparse-conditioned reconstruction")
 
         if was_training:
             pl_module.train()

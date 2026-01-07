@@ -1,10 +1,9 @@
 import torch
+from typing import Callable, Optional
 
 from src.diffusion.base.guidance import *
 from src.diffusion.base.scheduling import *
 from src.diffusion.base.sampling import *
-
-from typing import Callable
 
 
 def shift_respace_fn(t, shift=3.0):
@@ -62,10 +61,19 @@ class EulerSampler(BaseSampler):
             if self.step_fn == ode_step_fn:
                 logger.warning("current sampler is ODE sampler, but w_scheduler is enabled")
 
-    def _impl_sampling(self, net, noise, condition, uncondition):
+    def _impl_sampling(self, net, noise, condition, uncondition,
+                        cond_mask: Optional[torch.Tensor] = None,
+                        x_cond: Optional[torch.Tensor] = None):
         """
-        sampling process of Euler sampler
-        -
+        Sampling process of Euler sampler with optional sparse conditioning.
+
+        Args:
+            net: The denoising network
+            noise: Starting noise tensor [B,C,H,W]
+            condition: Conditioning embeddings
+            uncondition: Unconditional embeddings
+            cond_mask: [B,1,H,W] binary mask where 1=conditioned pixel
+            x_cond: [B,C,H,W] clean pixel values at conditioned locations
         """
         batch_size = noise.shape[0]
         steps = self.timesteps.to(noise.device, noise.dtype)
@@ -73,6 +81,12 @@ class EulerSampler(BaseSampler):
         x = noise
         x_trajs = [noise,]
         v_trajs = []
+
+        # Prepare cond_mask for CFG (duplicate for unconditional and conditional)
+        cfg_cond_mask = None
+        if cond_mask is not None:
+            cfg_cond_mask = torch.cat([cond_mask, cond_mask], dim=0)
+
         for i, (t_cur, t_next) in enumerate(zip(steps[:-1], steps[1:])):
             dt = t_next - t_cur
             t_cur = t_cur.repeat(batch_size)
@@ -84,9 +98,22 @@ class EulerSampler(BaseSampler):
             else:
                 w = 0.0
 
-            cfg_x = torch.cat([x, x], dim=0)
+            # For sparse conditioning: blend clean hints into x at each step
+            if cond_mask is not None and x_cond is not None:
+                # Get the corresponding "noisy" version of x_cond at current timestep
+                # In flow matching: x_t = alpha_t * x_0 + sigma_t * noise
+                alpha_t = self.scheduler.alpha(t_cur[:1])  # scalar
+                sigma_t = sigma[:1]  # scalar
+                # Create a compatible x_cond_t that blends into the denoising trajectory
+                # At t=0: x_t should be noise, at t=1: x_t should be x_0
+                # We want hint locations to guide towards x_cond
+                x_input = x * (1 - cond_mask) + x_cond * cond_mask
+            else:
+                x_input = x
+
+            cfg_x = torch.cat([x_input, x_input], dim=0)
             cfg_t = t_cur.repeat(2)
-            out = net(cfg_x, cfg_t, cfg_condition)
+            out = net(cfg_x, cfg_t, cfg_condition, cond_mask=cfg_cond_mask)
             if t_cur[0] > self.guidance_interval_min and t_cur[0] < self.guidance_interval_max:
                 guidance = self.guidance
                 out = self.guidance_fn(out, guidance)
@@ -98,6 +125,12 @@ class EulerSampler(BaseSampler):
                 x = self.step_fn(x, v, dt, s=s, w=w)
             else:
                 x = self.last_step_fn(x, v, dt, s=s, w=w)
+
+            # Repaint-style: after each step, replace hint locations with clean values
+            # This ensures the final output matches the sparse hints exactly
+            if cond_mask is not None and x_cond is not None:
+                x = x * (1 - cond_mask) + x_cond * cond_mask
+
             x_trajs.append(x)
             v_trajs.append(v)
         v_trajs.append(torch.zeros_like(x))
@@ -139,10 +172,19 @@ class HeunSampler(BaseSampler):
             if self.step_fn == ode_step_fn:
                 logger.warning("current sampler is ODE sampler, but w_scheduler is enabled")
 
-    def _impl_sampling(self, net, noise, condition, uncondition):
+    def _impl_sampling(self, net, noise, condition, uncondition,
+                        cond_mask: Optional[torch.Tensor] = None,
+                        x_cond: Optional[torch.Tensor] = None):
         """
-        sampling process of Henu sampler
-        -
+        Sampling process of Heun sampler with optional sparse conditioning.
+
+        Args:
+            net: The denoising network
+            noise: Starting noise tensor [B,C,H,W]
+            condition: Conditioning embeddings
+            uncondition: Unconditional embeddings
+            cond_mask: [B,1,H,W] binary mask where 1=conditioned pixel
+            x_cond: [B,C,H,W] clean pixel values at conditioned locations
         """
         batch_size = noise.shape[0]
         steps = self.timesteps.to(noise.device)
@@ -151,6 +193,12 @@ class HeunSampler(BaseSampler):
         v_hat, s_hat = 0.0, 0.0
         x_trajs = [noise, ]
         v_trajs = []
+
+        # Prepare cond_mask for CFG (duplicate for unconditional and conditional)
+        cfg_cond_mask = None
+        if cond_mask is not None:
+            cfg_cond_mask = torch.cat([cond_mask, cond_mask], dim=0)
+
         for i, (t_cur, t_next) in enumerate(zip(steps[:-1], steps[1:])):
             dt = t_next - t_cur
             t_cur = t_cur.repeat(batch_size)
@@ -167,10 +215,17 @@ class HeunSampler(BaseSampler):
                 w = self.w_scheduler.w(t_cur)
             else:
                 w = 0.0
+
+            # For sparse conditioning: blend clean hints into x at each step
+            if cond_mask is not None and x_cond is not None:
+                x_input = x * (1 - cond_mask) + x_cond * cond_mask
+            else:
+                x_input = x
+
             if i == 0 or self.exact_henu:
-                cfg_x = torch.cat([x, x], dim=0)
+                cfg_x = torch.cat([x_input, x_input], dim=0)
                 cfg_t_cur = t_cur.repeat(2)
-                out = net(cfg_x, cfg_t_cur, cfg_condition)
+                out = net(cfg_x, cfg_t_cur, cfg_condition, cond_mask=cfg_cond_mask)
                 out = self.guidance_fn(out, self.guidance)
                 v = out
                 s = ((alpha_over_dalpha)*v - x)/(sigma**2 - (alpha_over_dalpha)*dsigma_mul_sigma)
@@ -178,11 +233,18 @@ class HeunSampler(BaseSampler):
                 v = v_hat
                 s = s_hat
             x_hat = self.step_fn(x, v, dt, s=s, w=w)
-            # henu correct
+
+            # Repaint-style for x_hat
+            if cond_mask is not None and x_cond is not None:
+                x_hat_input = x_hat * (1 - cond_mask) + x_cond * cond_mask
+            else:
+                x_hat_input = x_hat
+
+            # heun correct
             if i < self.num_steps -1:
-                cfg_x_hat = torch.cat([x_hat, x_hat], dim=0)
+                cfg_x_hat = torch.cat([x_hat_input, x_hat_input], dim=0)
                 cfg_t_hat = t_hat.repeat(2)
-                out = net(cfg_x_hat, cfg_t_hat, cfg_condition)
+                out = net(cfg_x_hat, cfg_t_hat, cfg_condition, cond_mask=cfg_cond_mask)
                 out = self.guidance_fn(out, self.guidance)
                 v_hat = out
                 s_hat = ((alpha_over_dalpha_hat)* v_hat - x_hat) / (sigma_hat ** 2 - (alpha_over_dalpha_hat) * dsigma_mul_sigma_hat)
@@ -191,6 +253,11 @@ class HeunSampler(BaseSampler):
                 x = self.step_fn(x, v, dt, s=s, w=w)
             else:
                 x = self.last_step_fn(x, v, dt, s=s, w=w)
+
+            # Repaint-style: after each step, replace hint locations with clean values
+            if cond_mask is not None and x_cond is not None:
+                x = x * (1 - cond_mask) + x_cond * cond_mask
+
             x_trajs.append(x)
             v_trajs.append(v)
         v_trajs.append(torch.zeros_like(x))
