@@ -367,6 +367,8 @@ class SparseReconProgressCallback(Callback):
                 net.decoder_patch_scaling_w = scale
 
         # Run diffusion at high resolution
+        # Note: disable_spatial_bias=True reduces checkerboard artifacts at SR
+        # by preventing overly-localized attention that causes patch boundary discontinuities
         noise_hr = torch.randn_like(x_cond_hr)
         samples_hr = pl_module.diffusion_sampler(
             pl_module.ema_denoiser,
@@ -375,6 +377,7 @@ class SparseReconProgressCallback(Callback):
             uncondition,
             cond_mask=cond_mask_hr,
             x_cond=x_cond_hr,
+            disable_spatial_bias=True,
         )
         if isinstance(samples_hr, tuple):
             samples_hr = samples_hr[0][-1]

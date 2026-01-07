@@ -515,7 +515,7 @@ class PixNerDiT(nn.Module):
 
         return data, data_mask
 
-    def forward(self, x, t, y, cond_mask=None, superres_scale: float = 1.0, **kwargs):
+    def forward(self, x, t, y, cond_mask=None, superres_scale: float = 1.0, disable_spatial_bias: bool = False, **kwargs):
         """
         x: [B,C,H,W]
         t: [B]
@@ -657,7 +657,9 @@ class PixNerDiT(nn.Module):
 
             # 3) cross-attend tokens -> queries (no latent bottleneck)
             # Option B: Pass coordinates for spatial attention bias
-            if self.sfc_spatial_bias:
+            # Can be disabled at inference (e.g., for super-resolution to avoid checkerboard)
+            use_spatial_bias = self.sfc_spatial_bias and not disable_spatial_bias
+            if use_spatial_bias:
                 s = self.sfc_cross(queries, tokens, token_mask, query_coords, token_coords)
             else:
                 s = self.sfc_cross(queries, tokens, token_mask)  # (B,L,D)
