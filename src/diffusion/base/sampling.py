@@ -23,14 +23,16 @@ class BaseSampler(nn.Module):
 
     def _impl_sampling(self, net, noise, condition, uncondition,
                        cond_mask: Optional[torch.Tensor] = None,
-                       x_cond: Optional[torch.Tensor] = None):
+                       x_cond: Optional[torch.Tensor] = None,
+                       **net_kwargs):
         raise NotImplementedError
 
     @torch.autocast("cuda", dtype=torch.bfloat16)
     def forward(self, net, noise, condition, uncondition,
                 return_x_trajs=False, return_v_trajs=False,
                 cond_mask: Optional[torch.Tensor] = None,
-                x_cond: Optional[torch.Tensor] = None):
+                x_cond: Optional[torch.Tensor] = None,
+                **net_kwargs):
         """
         Args:
             net: The denoising network
@@ -41,10 +43,11 @@ class BaseSampler(nn.Module):
             return_v_trajs: Whether to return trajectory of v values
             cond_mask: [B,1,H,W] binary mask where 1=conditioned pixel
             x_cond: [B,C,H,W] clean pixel values at conditioned locations
+            **net_kwargs: Additional kwargs passed to the denoiser (e.g., disable_spatial_bias)
         """
         x_trajs, v_trajs = self._impl_sampling(
             net, noise, condition, uncondition,
-            cond_mask=cond_mask, x_cond=x_cond
+            cond_mask=cond_mask, x_cond=x_cond, **net_kwargs
         )
         if return_x_trajs and return_v_trajs:
             return x_trajs[-1], x_trajs, v_trajs

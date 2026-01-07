@@ -63,7 +63,8 @@ class EulerSampler(BaseSampler):
 
     def _impl_sampling(self, net, noise, condition, uncondition,
                         cond_mask: Optional[torch.Tensor] = None,
-                        x_cond: Optional[torch.Tensor] = None):
+                        x_cond: Optional[torch.Tensor] = None,
+                        **net_kwargs):
         """
         Sampling process of Euler sampler with optional sparse conditioning.
 
@@ -74,6 +75,7 @@ class EulerSampler(BaseSampler):
             uncondition: Unconditional embeddings
             cond_mask: [B,1,H,W] binary mask where 1=conditioned pixel
             x_cond: [B,C,H,W] clean pixel values at conditioned locations
+            **net_kwargs: Additional kwargs passed to the denoiser (e.g., disable_spatial_bias)
         """
         batch_size = noise.shape[0]
         steps = self.timesteps.to(noise.device, noise.dtype)
@@ -113,7 +115,7 @@ class EulerSampler(BaseSampler):
 
             cfg_x = torch.cat([x_input, x_input], dim=0)
             cfg_t = t_cur.repeat(2)
-            out = net(cfg_x, cfg_t, cfg_condition, cond_mask=cfg_cond_mask)
+            out = net(cfg_x, cfg_t, cfg_condition, cond_mask=cfg_cond_mask, **net_kwargs)
             if t_cur[0] > self.guidance_interval_min and t_cur[0] < self.guidance_interval_max:
                 guidance = self.guidance
                 out = self.guidance_fn(out, guidance)
@@ -174,7 +176,8 @@ class HeunSampler(BaseSampler):
 
     def _impl_sampling(self, net, noise, condition, uncondition,
                         cond_mask: Optional[torch.Tensor] = None,
-                        x_cond: Optional[torch.Tensor] = None):
+                        x_cond: Optional[torch.Tensor] = None,
+                        **net_kwargs):
         """
         Sampling process of Heun sampler with optional sparse conditioning.
 
@@ -185,6 +188,7 @@ class HeunSampler(BaseSampler):
             uncondition: Unconditional embeddings
             cond_mask: [B,1,H,W] binary mask where 1=conditioned pixel
             x_cond: [B,C,H,W] clean pixel values at conditioned locations
+            **net_kwargs: Additional kwargs passed to the denoiser (e.g., disable_spatial_bias)
         """
         batch_size = noise.shape[0]
         steps = self.timesteps.to(noise.device)
@@ -225,7 +229,7 @@ class HeunSampler(BaseSampler):
             if i == 0 or self.exact_henu:
                 cfg_x = torch.cat([x_input, x_input], dim=0)
                 cfg_t_cur = t_cur.repeat(2)
-                out = net(cfg_x, cfg_t_cur, cfg_condition, cond_mask=cfg_cond_mask)
+                out = net(cfg_x, cfg_t_cur, cfg_condition, cond_mask=cfg_cond_mask, **net_kwargs)
                 out = self.guidance_fn(out, self.guidance)
                 v = out
                 s = ((alpha_over_dalpha)*v - x)/(sigma**2 - (alpha_over_dalpha)*dsigma_mul_sigma)
@@ -244,7 +248,7 @@ class HeunSampler(BaseSampler):
             if i < self.num_steps -1:
                 cfg_x_hat = torch.cat([x_hat_input, x_hat_input], dim=0)
                 cfg_t_hat = t_hat.repeat(2)
-                out = net(cfg_x_hat, cfg_t_hat, cfg_condition, cond_mask=cfg_cond_mask)
+                out = net(cfg_x_hat, cfg_t_hat, cfg_condition, cond_mask=cfg_cond_mask, **net_kwargs)
                 out = self.guidance_fn(out, self.guidance)
                 v_hat = out
                 s_hat = ((alpha_over_dalpha_hat)* v_hat - x_hat) / (sigma_hat ** 2 - (alpha_over_dalpha_hat) * dsigma_mul_sigma_hat)
