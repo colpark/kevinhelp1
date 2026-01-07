@@ -297,72 +297,36 @@ class SparseReconProgressCallback(Callback):
         was_training = pl_module.training
         pl_module.eval()
 
-        # 32x32 sparse recon
+        # Get latent representation and generate sparse mask for visualization
         x_latent_32 = pl_module.vae.encode(images)
-        cond_mask_32, target_mask_32 = pl_module._make_sparsity_masks(x_latent_32)
+        cond_mask_32, _ = pl_module._make_sparsity_masks(x_latent_32)
 
         condition, uncondition = pl_module.conditioner(labels)
 
+        # Class-conditional generation (standard diffusion sampling)
         noise_32 = torch.randn_like(x_latent_32)
         samples_latent_32 = pl_module.diffusion_sampler(
             pl_module.ema_denoiser,
             noise_32,
             condition,
             uncondition,
-            cond_mask=cond_mask_32,
-            x_cond=x_latent_32,
         )
-        recon_32 = pl_module.vae.decode(samples_latent_32)
-
-        # 128x128 sparse super-res (1-pixel lift from 32x32 cond)
-        scale = self.superres_factor
-        H_hr = self.base_res * scale
-        W_hr = self.base_res * scale
-
-        cond_mask_128 = torch.zeros((B, 1, H_hr, W_hr), device=device, dtype=x_latent_32.dtype)
-        cond_mask_128[:, :, ::scale, ::scale] = cond_mask_32
-
-        x_cond_128 = torch.zeros((B, x_latent_32.shape[1], H_hr, W_hr), device=device, dtype=x_latent_32.dtype)
-        x_cond_128[:, :, ::scale, ::scale] = x_latent_32
-
-        old_scales = {}
-        for name, net in [("denoiser", pl_module.denoiser), ("ema_denoiser", pl_module.ema_denoiser)]:
-            if hasattr(net, "decoder_patch_scaling_h"):
-                old_scales[name] = (net.decoder_patch_scaling_h, net.decoder_patch_scaling_w)
-                net.decoder_patch_scaling_h = scale
-                net.decoder_patch_scaling_w = scale
-
-        noise_128 = torch.randn_like(x_cond_128)
-        samples_latent_128 = pl_module.diffusion_sampler(
-            pl_module.ema_denoiser,
-            noise_128,
-            condition,
-            uncondition,
-            cond_mask=cond_mask_128,
-            x_cond=x_cond_128,
-        )
-        recon_128 = pl_module.vae.decode(samples_latent_128)
-
-        for name, net in [("denoiser", pl_module.denoiser), ("ema_denoiser", pl_module.ema_denoiser)]:
-            if name in old_scales:
-                h, w = old_scales[name]
-                net.decoder_patch_scaling_h = h
-                net.decoder_patch_scaling_w = w
+        # Handle tuple return (x_trajs, v_trajs) from sampler
+        if isinstance(samples_latent_32, tuple):
+            samples_latent_32 = samples_latent_32[0][-1]  # Get final x from trajectory
+        samples_32 = pl_module.vae.decode(samples_latent_32)
 
         step = trainer.global_step
         tag = f"step_{step:06d}"
 
-        # Create sparse input visualization (ground truth with unobserved pixels grayed out)
+        # Create sparse input visualization (ground truth with unobserved pixels blacked out)
         sparse_input = images.clone()
-        # Expand mask to match image channels and apply
         mask_expanded = cond_mask_32.expand_as(images)
-        # Gray out unobserved pixels (set to gray = 0 in normalized space)
         sparse_input = sparse_input * mask_expanded
 
         self._save_grid(images, self.progress_dir / f"{tag}_1_gt.png")
         self._save_grid(sparse_input, self.progress_dir / f"{tag}_2_sparse_input.png")
-        self._save_grid(recon_32, self.progress_dir / f"{tag}_3_recon32.png")
-        self._save_grid(recon_128, self.progress_dir / f"{tag}_4_superres128.png")
+        self._save_grid(samples_32, self.progress_dir / f"{tag}_3_samples.png")
 
         print(f"\n[Step {step}] Saved visualizations to {self.progress_dir}")
 
