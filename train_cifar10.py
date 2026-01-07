@@ -98,6 +98,16 @@ class SparseLightningModel(LightningModel):
 
         return cond_mask
 
+    def _make_sparsity_masks(self, x: torch.Tensor):
+        """
+        Generate sparse mask for visualization callback.
+        Returns (cond_mask, target_mask) tuple.
+        """
+        cond_mask = self._generate_sparse_mask(x)
+        # For visualization, target_mask is the complement (pixels to predict)
+        target_mask = 1.0 - cond_mask
+        return cond_mask, target_mask
+
     def training_step(self, batch, batch_idx):
         x, y, metadata = batch
 
@@ -342,9 +352,19 @@ class SparseReconProgressCallback(Callback):
         step = trainer.global_step
         tag = f"step_{step:06d}"
 
-        self._save_grid(images, self.progress_dir / f"{tag}_gt32.png")
-        self._save_grid(recon_32, self.progress_dir / f"{tag}_recon32.png")
-        self._save_grid(recon_128, self.progress_dir / f"{tag}_recon128.png")
+        # Create sparse input visualization (ground truth with unobserved pixels grayed out)
+        sparse_input = images.clone()
+        # Expand mask to match image channels and apply
+        mask_expanded = cond_mask_32.expand_as(images)
+        # Gray out unobserved pixels (set to gray = 0 in normalized space)
+        sparse_input = sparse_input * mask_expanded
+
+        self._save_grid(images, self.progress_dir / f"{tag}_1_gt.png")
+        self._save_grid(sparse_input, self.progress_dir / f"{tag}_2_sparse_input.png")
+        self._save_grid(recon_32, self.progress_dir / f"{tag}_3_recon32.png")
+        self._save_grid(recon_128, self.progress_dir / f"{tag}_4_superres128.png")
+
+        print(f"\n[Step {step}] Saved visualizations to {self.progress_dir}")
 
         if was_training:
             pl_module.train()
