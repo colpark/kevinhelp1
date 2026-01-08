@@ -1,0 +1,64 @@
+import time
+
+import torch
+import torch.nn as nn
+
+
+class BaseTrainer(nn.Module):
+    def __init__(self,
+                 null_condition_p=0.1,
+        ):
+        super(BaseTrainer, self).__init__()
+        self.null_condition_p = null_condition_p
+
+    def preproprocess(self, x, condition, uncondition, metadata):
+        bsz = x.shape[0]
+        if self.null_condition_p > 0:
+            mask = torch.rand((bsz), device=condition.device) < self.null_condition_p
+            mask = mask.view(-1, *([1] * (len(condition.shape) - 1))).to(condition.dtype)
+            condition = condition * (1 - mask) + uncondition * mask
+        return x, condition, metadata
+
+    # NEW: allow masks as optional kwargs
+    def _impl_trainstep(self, net, ema_net, solver, x, y, metadata=None,
+                        cond_mask=None, target_mask=None):
+        """
+        Subclasses should override this.
+
+        Args:
+            net:          main denoiser
+            ema_net:      EMA denoiser (unused here but part of interface)
+            solver:       sampler / ODE solver (unused in FM trainer)
+            x:            latent or image tensor, (B,C,H,W)
+            y:            conditioning (e.g., class embedding)
+            metadata:     extra info from dataloader
+            cond_mask:    (B,1,H,W) float 0/1, conditioning region
+            target_mask:  (B,1,H,W) float 0/1, loss region
+        """
+        raise NotImplementedError
+
+    @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    def __call__(self,
+                 net,
+                 ema_net,
+                 solver,
+                 x,
+                 condition,
+                 uncondition,
+                 metadata=None,
+                 cond_mask=None,
+                 target_mask=None):
+        # null-conditioning preprocessing (same as before)
+        x, condition, metadata = self.preproprocess(x, condition, uncondition, metadata)
+
+        # Forward into subclass implementation, passing masks through
+        return self._impl_trainstep(
+            net,
+            ema_net,
+            solver,
+            x,
+            condition,
+            metadata,
+            cond_mask=cond_mask,
+            target_mask=target_mask,
+        )

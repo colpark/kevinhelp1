@@ -1,0 +1,14 @@
+
+# Reference implementation exclusions
+kevin_pnbase_01072026/data/
+kevin_pnbase_01072026/outputs/
+kevin_pnbase_01072026/.git/
+kevin_pnbase_01072026/.ipynb_checkpoints/
+kevin_pnbase_01072026/PixNerd/workdirs/
+kevin_pnbase_01072026/PixNerd/outputs/
+kevin_pnbase_01072026/PixNerd/data/
+kevin_pnbase_01072026/PixNerd/figs/
+kevin_pnbase_01072026/PixNerd/.idea/
+kevin_pnbase_01072026/PixNerd/src.zip
+kevin_pnbase_01072026/**/__pycache__/
+kevin_pnbase_01072026/**/*.pyc
