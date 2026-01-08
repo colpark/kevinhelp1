@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import lru_cache
+from typing import Optional
 
 from src.models.layers.attention_op import attention
 from src.models.layers.rope import apply_rotary_emb, precompute_freqs_cis_ex2d as precompute_freqs_cis_2d
@@ -206,7 +207,7 @@ class SFCTransformerBlock(nn.Module):
         self.mlp = FeedForward(dim, mlp_hidden)
         self.drop2 = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, token_mask: torch.Tensor | None):
+    def forward(self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None):
         """
         x: (B,T,D)
         token_mask: (B,T) bool, True=real token, False=pad
