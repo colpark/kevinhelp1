@@ -1,6 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 CIFAR-10 Training with Options A/B (Ablation Study)
+
+Based on kevin_pnbase_01072026/train_cifar10.py with Options A/B added.
 
 Option A (sfc_unified_coords): Shared coordinate embedder for tokens & queries
 Option B (sfc_spatial_bias): Spatial attention bias in cross-attention
@@ -18,574 +20,396 @@ Usage:
     # Neither (baseline, same as kevin_pnbase_01072026)
     python train_cifar10_options_ab.py --exp_name cifar10_sfc_baseline --no_option_a --no_option_b
 """
+from torchvision.datasets import CIFAR10
+from torchvision import transforms
+from torchvision.utils import save_image
+
 import os
 import sys
 import argparse
-import math
 from pathlib import Path
+from functools import partial
 
 # Add PixNerd to path
-sys.path.insert(0, str(Path(__file__).parent / "PixNerd"))
+SCRIPT_DIR = Path(__file__).parent.absolute()
+PIXNERD_DIR = SCRIPT_DIR / "PixNerd"
+if PIXNERD_DIR.exists():
+    os.chdir(PIXNERD_DIR)
+    sys.path.insert(0, str(PIXNERD_DIR))
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
-from pytorch_lightning.loggers import TensorBoardLogger
-import torchvision
-import torchvision.transforms as transforms
-from PIL import Image
-import numpy as np
+# Completely disable torch.compile/dynamo to avoid inductor errors
+torch._dynamo.config.disable = True
 
+from lightning import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
+from lightning.pytorch.loggers import CSVLogger
+
+from src.models.autoencoder.pixel import PixelAE
+from src.models.conditioner.class_label import LabelConditioner
 from src.models.transformer.pixnerd_c2i_heavydecoder import PixNerDiT
-from src.diffusion.flow_matching.training import FlowMatchingTrainer
-from src.diffusion.flow_matching.sampling import EulerSampler
 from src.diffusion.flow_matching.scheduling import LinearScheduler
+from src.diffusion.flow_matching.sampling import EulerSampler, ode_step_fn
 from src.diffusion.base.guidance import simple_guidance_fn
-
-
-class CIFAR10DataModule(pl.LightningDataModule):
-    def __init__(self, data_dir="./data", batch_size=128, num_workers=4):
-        super().__init__()
-        self.data_dir = data_dir
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-
-        self.transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-
-        self.test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-
-    def prepare_data(self):
-        torchvision.datasets.CIFAR10(root=self.data_dir, train=True, download=True)
-        torchvision.datasets.CIFAR10(root=self.data_dir, train=False, download=True)
-
-    def setup(self, stage=None):
-        self.train_dataset = torchvision.datasets.CIFAR10(
-            root=self.data_dir, train=True, transform=self.transform
-        )
-        self.val_dataset = torchvision.datasets.CIFAR10(
-            root=self.data_dir, train=False, transform=self.test_transform
-        )
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-        )
-
-
-class SparseConditioningModule(pl.LightningModule):
-    """
-    Lightning module for sparse conditioning with Options A/B ablation.
-    """
-    def __init__(
-        self,
-        hidden_size=768,
-        num_groups=12,
-        num_encoder_blocks=12,
-        num_decoder_blocks=2,
-        decoder_hidden_size=64,
-        num_classes=10,
-        patch_size=2,
-        learning_rate=1e-4,
-        weight_decay=0.0,
-        warmup_steps=5000,
-        max_steps=200000,
-        sparsity=0.4,
-        cond_fraction=0.5,
-        # Options A/B
-        sfc_unified_coords=True,   # Option A
-        sfc_spatial_bias=True,     # Option B
-        # SFC settings
-        sfc_curve="hilbert",
-        sfc_group_size=8,
-        sfc_cross_depth=2,
-        sfc_self_depth=2,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
-        self.sparsity = sparsity
-        self.cond_fraction = cond_fraction
-
-        # Build model with Options A/B
-        self.model = PixNerDiT(
-            in_channels=3,
-            hidden_size=hidden_size,
-            num_groups=num_groups,
-            num_encoder_blocks=num_encoder_blocks,
-            num_decoder_blocks=num_decoder_blocks,
-            decoder_hidden_size=decoder_hidden_size,
-            num_classes=num_classes,
-            patch_size=patch_size,
-            encoder_type="sfc",
-            sfc_curve=sfc_curve,
-            sfc_group_size=sfc_group_size,
-            sfc_cross_depth=sfc_cross_depth,
-            sfc_self_depth=sfc_self_depth,
-            # Options A/B
-            sfc_unified_coords=sfc_unified_coords,
-            sfc_spatial_bias=sfc_spatial_bias,
-        )
-
-        # Flow matching trainer
-        scheduler = LinearScheduler()
-        self.diffusion_trainer = FlowMatchingTrainer(scheduler=scheduler)
-
-        # Sampler for validation
-        self.sampler = EulerSampler(
-            scheduler=scheduler,
-            w_scheduler=None,
-            num_steps=50,
-            guidance=4.0,
-            guidance_fn=simple_guidance_fn,
-            timeshift=1.0,
-        )
-
-    def generate_sparsity_masks(self, batch_size, height, width, device, dtype=torch.float32):
-        """
-        Generate disjoint cond_mask and target_mask.
-
-        With sparsity=0.4 and cond_fraction=0.5:
-          - 40% of pixels are "observed"
-          - 20% go to cond_mask (hints given to model)
-          - 20% go to target_mask (where loss is computed)
-          - 60% are unobserved (not in either mask)
-
-        Returns:
-            cond_mask: (B,1,H,W) float, 1=hint pixel
-            target_mask: (B,1,H,W) float, 1=compute loss here
-        """
-        B, H, W = batch_size, height, width
-        total = H * W
-
-        # Total observed pixels
-        k_obs = int(round(self.sparsity * total))
-        k_obs = max(0, min(total, k_obs))
-
-        if k_obs == 0:
-            cond_mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
-            target_mask = torch.zeros_like(cond_mask)
-            return cond_mask, target_mask
-
-        # Split observed into cond and target
-        k_cond = int(round(self.cond_fraction * k_obs))
-        k_cond = max(0, min(k_obs, k_cond))
-        k_target = k_obs - k_cond
-
-        cond_mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
-        target_mask = torch.zeros_like(cond_mask)
-
-        flat_idx = torch.arange(total, device=device)
-
-        for b in range(B):
-            perm = flat_idx[torch.randperm(total, device=device)]
-            obs_idx = perm[:k_obs]
-
-            if k_cond > 0:
-                cond_idx = obs_idx[:k_cond]
-                cond_mask[b].view(-1)[cond_idx] = 1.0
-
-            if k_target > 0:
-                target_idx = obs_idx[k_cond:k_cond + k_target]
-                target_mask[b].view(-1)[target_idx] = 1.0
-
-        return cond_mask, target_mask
-
-    def forward(self, x, t, y, cond_mask=None, **kwargs):
-        return self.model(x, t, y, cond_mask=cond_mask, **kwargs)
-
-    def training_step(self, batch, batch_idx):
-        images, labels = batch
-        B, C, H, W = images.shape
-        device = images.device
-
-        # Generate disjoint cond and target masks
-        # With sparsity=0.4, cond_fraction=0.5:
-        #   - cond_mask: 20% of pixels (hints)
-        #   - target_mask: 20% of pixels (loss computed here)
-        #   - remaining 60%: unobserved
-        cond_mask, target_mask = self.generate_sparsity_masks(B, H, W, device, images.dtype)
-
-        # Null labels for CFG training (drop conditioning with probability from trainer)
-        null_labels = torch.full_like(labels, self.model.num_classes)
-
-        # Flow matching training step via BaseTrainer.__call__
-        # - cond_mask pixels are clamped to clean GT in x_t
-        # - loss is computed ONLY on target_mask pixels
-        loss_dict = self.diffusion_trainer(
-            net=self.model,
-            ema_net=self.model,  # not using separate EMA in this trainer
-            solver=self.sampler,  # not used in FM training, but part of interface
-            x=images,
-            condition=labels,
-            uncondition=null_labels,
-            metadata=None,
-            cond_mask=cond_mask,
-            target_mask=target_mask,
-        )
-
-        loss = loss_dict["loss"]
-        self.log("train/loss", loss, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        images, labels = batch
-        B, C, H, W = images.shape
-        device = images.device
-
-        # Same mask generation for validation
-        cond_mask, target_mask = self.generate_sparsity_masks(B, H, W, device, images.dtype)
-
-        # Null labels for CFG
-        null_labels = torch.full_like(labels, self.model.num_classes)
-
-        loss_dict = self.diffusion_trainer(
-            net=self.model,
-            ema_net=self.model,
-            solver=self.sampler,
-            x=images,
-            condition=labels,
-            uncondition=null_labels,
-            metadata=None,
-            cond_mask=cond_mask,
-            target_mask=target_mask,
-        )
-
-        loss = loss_dict["loss"]
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-
-        def lr_lambda(step):
-            if step < self.warmup_steps:
-                return step / self.warmup_steps
-            progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-            return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            }
-        }
-
-    @torch.no_grad()
-    def sample(self, labels, cond_mask=None, x_cond=None, num_steps=50, guidance=4.0, disable_spatial_bias=False):
-        """Generate samples with optional sparse conditioning."""
-        device = next(self.parameters()).device
-        B = labels.shape[0]
-
-        # Start from noise
-        noise = torch.randn(B, 3, 32, 32, device=device)
-
-        # Null labels for CFG
-        null_labels = torch.full_like(labels, self.model.num_classes)
-
-        # Create sampler with desired settings
-        sampler = EulerSampler(
-            scheduler=CosineScheduler(),
-            w_scheduler=None,
-            num_steps=num_steps,
-            guidance=guidance,
-            guidance_fn=simple_guidance_fn,
-            timeshift=1.0,
-        )
-
-        # Wrap model for CFG
-        def denoiser(x, t, cond, cond_mask=None, **kwargs):
-            return self.model(x, t, cond, cond_mask=cond_mask, disable_spatial_bias=disable_spatial_bias, **kwargs)
-
-        # Sample
-        x_trajs, _ = sampler.sampling(
-            denoiser, noise, labels, null_labels,
-            cond_mask=cond_mask,
-            x_cond=x_cond,
-        )
-
-        return x_trajs[-1]
-
-
-class SparseReconProgressCallback(Callback):
-    """Callback to generate and save sample reconstructions during training."""
-
-    def __init__(self, sample_every=10000, output_dir="outputs/samples", num_samples=8):
-        super().__init__()
-        self.sample_every = sample_every
-        self.output_dir = Path(output_dir)
-        self.num_samples = num_samples
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if trainer.global_step > 0 and trainer.global_step % self.sample_every == 0:
-            self._generate_samples(trainer, pl_module, batch)
-
-    @torch.no_grad()
-    def _generate_samples(self, trainer, pl_module, batch):
-        pl_module.eval()
-        device = pl_module.device
-
-        images, labels = batch
-        images = images[:self.num_samples].to(device)
-        labels = labels[:self.num_samples].to(device)
-
-        B, C, H, W = images.shape
-
-        # For inference/visualization, we use cond_mask as hints
-        # (we don't need target_mask for sampling, only for training)
-        cond_mask, _ = pl_module.generate_sparsity_masks(B, H, W, device, images.dtype)
-        x_cond = images  # Use original images as conditioning values
-
-        # ============================================================
-        # 1. 32x32 Reconstruction
-        # ============================================================
-        recon_32 = pl_module.sample(
-            labels, cond_mask=cond_mask, x_cond=x_cond,
-            num_steps=50, guidance=4.0
-        )
-
-        # ============================================================
-        # 2. 128x128 Super-Resolution (with disable_spatial_bias=True)
-        # ============================================================
-        # For SR, use full 32x32 as conditioning
-        full_mask = torch.ones(B, 1, 32, 32, device=device)
-
-        # Set decoder patch scaling for 4x SR
-        pl_module.model.decoder_patch_scaling_h = 4.0
-        pl_module.model.decoder_patch_scaling_w = 4.0
-
-        noise_sr = torch.randn(B, 3, 128, 128, device=device)
-        null_labels = torch.full_like(labels, pl_module.model.num_classes)
-
-        sampler = EulerSampler(
-            scheduler=CosineScheduler(),
-            w_scheduler=None,
-            num_steps=50,
-            guidance=4.0,
-            guidance_fn=simple_guidance_fn,
-            timeshift=1.0,
-        )
-
-        def denoiser_sr(x, t, cond, cond_mask=None, **kwargs):
-            # IMPORTANT: disable_spatial_bias=True for SR to avoid checkerboard
-            return pl_module.model(x, t, cond, cond_mask=cond_mask, disable_spatial_bias=True, **kwargs)
-
-        x_trajs_sr, _ = sampler.sampling(
-            denoiser_sr, noise_sr, labels, null_labels,
-            cond_mask=full_mask,
-            x_cond=images,
-        )
-        recon_128 = x_trajs_sr[-1]
-
-        # Reset scaling
-        pl_module.model.decoder_patch_scaling_h = 1.0
-        pl_module.model.decoder_patch_scaling_w = 1.0
-
-        # ============================================================
-        # Save images
-        # ============================================================
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Denormalize
-        def denorm(x):
-            return (x * 0.5 + 0.5).clamp(0, 1)
-
-        # Create visualization grid
-        # Row 1: Original | Sparse Hints | Recon 32x32 | SR 128x128 (resized to 32x32 for comparison)
-        originals = denorm(images)
-        sparse_vis = originals * cond_mask + (1 - cond_mask) * 0.5
-        recons = denorm(recon_32)
-        sr_resized = F.interpolate(denorm(recon_128), size=(32, 32), mode='bilinear', align_corners=False)
-
-        # Concat horizontally
-        grid_rows = []
-        for i in range(min(4, B)):
-            row = torch.cat([originals[i], sparse_vis[i], recons[i], sr_resized[i]], dim=2)  # (C, H, 4*W)
-            grid_rows.append(row)
-        grid = torch.cat(grid_rows, dim=1)  # (C, 4*H, 4*W)
-
-        # Save
-        grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        Image.fromarray(grid_np).save(self.output_dir / f"step_{trainer.global_step:06d}.png")
-
-        # Also save full-res SR
-        sr_grid = torchvision.utils.make_grid(denorm(recon_128), nrow=4)
-        sr_np = (sr_grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        Image.fromarray(sr_np).save(self.output_dir / f"step_{trainer.global_step:06d}_sr128.png")
-
-        pl_module.train()
-        print(f"[Step {trainer.global_step}] Saved samples to {self.output_dir}")
-
-
-def main():
+from src.diffusion.flow_matching.training import FlowMatchingTrainer
+from src.callbacks.simple_ema import SimpleEMA
+from src.callbacks.save_images import SaveImagesHook
+from src.lightning_model import LightningModel
+from src.lightning_data import DataModule
+from src.data.dataset.cifar10 import PixCIFAR10, CIFAR10RandomNDataset
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description="Train CIFAR-10 with Options A/B")
 
-    # Experiment
-    parser.add_argument("--exp_name", type=str, default="cifar10_sfc_ab")
-    parser.add_argument("--output_dir", type=str, default="outputs")
+    # Training config
+    parser.add_argument("--max_steps", type=int, default=300000, help="Max training steps")
+    parser.add_argument("--batch_size", type=int, default=128, help="Training batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
 
-    # Data
-    parser.add_argument("--data_dir", type=str, default="./data")
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_classes", type=int, default=10)
+    parser.add_argument("--image_size", type=int, default=32)
 
-    # Model
-    parser.add_argument("--hidden_size", type=int, default=768)
-    parser.add_argument("--num_groups", type=int, default=12)
-    parser.add_argument("--num_encoder_blocks", type=int, default=12)
-    parser.add_argument("--num_decoder_blocks", type=int, default=2)
+    # Model config
+    parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--decoder_hidden_size", type=int, default=64)
-    parser.add_argument("--patch_size", type=int, default=2)
+    parser.add_argument("--num_encoder_blocks", type=int, default=8)
+    parser.add_argument("--num_decoder_blocks", type=int, default=2)
+    parser.add_argument("--patch_size", type=int, default=8)
+    parser.add_argument("--num_groups", type=int, default=8)
 
-    # Options A/B (the key ablation flags)
-    parser.add_argument("--option_a", action="store_true", default=True,
-                        help="Enable Option A: unified coord embedding")
-    parser.add_argument("--no_option_a", action="store_false", dest="option_a",
-                        help="Disable Option A")
-    parser.add_argument("--option_b", action="store_true", default=True,
-                        help="Enable Option B: spatial attention bias")
-    parser.add_argument("--no_option_b", action="store_false", dest="option_b",
-                        help="Disable Option B")
+    # Sampler config
+    parser.add_argument("--guidance", type=float, default=2.0)
+    parser.add_argument("--num_sample_steps", type=int, default=200)
 
-    # SFC settings
+    # Logging
+    parser.add_argument("--exp_name", type=str, default="cifar10_options_ab")
+    parser.add_argument("--output_dir", type=str, default="./workdirs")
+
+    # Checkpointing
+    parser.add_argument("--save_every_n_steps", type=int, default=5000)
+    parser.add_argument("--val_every_n_epochs", type=int, default=100)
+    parser.add_argument("--resume", type=str, default=None)
+
+    # Hardware
+    parser.add_argument("--precision", type=str, default="bf16-mixed")
+    parser.add_argument("--devices", type=int, default=1)
+
+    # Sparsity-conditioning (training uses cond_mask + target_mask)
+    parser.add_argument("--sparsity", type=float, default=0.4)
+    parser.add_argument("--cond_fraction", type=float, default=0.5)
+
+    # Progress sampling
+    parser.add_argument("--sample_every_n_steps", type=int, default=10000)
+    parser.add_argument("--sample_batch_size", type=int, default=8)
+
+    # SFC encoder settings
     parser.add_argument("--sfc_curve", type=str, default="hilbert", choices=["hilbert", "zorder"])
     parser.add_argument("--sfc_group_size", type=int, default=8)
     parser.add_argument("--sfc_cross_depth", type=int, default=2)
     parser.add_argument("--sfc_self_depth", type=int, default=2)
 
-    # Training
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_steps", type=int, default=5000)
-    parser.add_argument("--max_steps", type=int, default=200000)
-    parser.add_argument("--sparsity", type=float, default=0.4)
-    parser.add_argument("--cond_fraction", type=float, default=0.5)
+    # Options A/B (the main ablation controls)
+    parser.add_argument("--option_a", dest="option_a", action="store_true",
+                        help="Enable Option A (sfc_unified_coords)")
+    parser.add_argument("--no_option_a", dest="option_a", action="store_false",
+                        help="Disable Option A")
+    parser.set_defaults(option_a=True)
 
-    # Callbacks
-    parser.add_argument("--sample_every", type=int, default=10000)
+    parser.add_argument("--option_b", dest="option_b", action="store_true",
+                        help="Enable Option B (sfc_spatial_bias)")
+    parser.add_argument("--no_option_b", dest="option_b", action="store_false",
+                        help="Disable Option B")
+    parser.set_defaults(option_b=True)
 
-    # Hardware
-    parser.add_argument("--accelerator", type=str, default="auto")
-    parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="16-mixed")
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    # Print configuration
-    print("=" * 60)
-    print(f"Training CIFAR-10 with Options A/B Ablation")
-    print("=" * 60)
-    print(f"  Experiment: {args.exp_name}")
-    print(f"  Option A (unified coords): {args.option_a}")
-    print(f"  Option B (spatial bias):   {args.option_b}")
-    print(f"  Sparsity: {args.sparsity}")
-    print(f"  Cond fraction: {args.cond_fraction}")
-    print(f"  Max steps: {args.max_steps}")
-    print("=" * 60)
+class SparseReconProgressCallback(Callback):
+    """
+    Periodically runs sparse-conditioned reconstruction & super-res on a fixed
+    set of images and saves image grids to disk.
+    """
+    def __init__(
+        self,
+        data_root: str,
+        out_dir: Path,
+        sample_every_n_steps: int = 10000,
+        sample_batch_size: int = 8,
+        base_res: int = 32,
+        superres_factor: int = 4,
+    ):
+        super().__init__()
+        self.data_root = data_root
+        self.out_dir = Path(out_dir)
+        self.sample_every_n_steps = sample_every_n_steps
+        self.sample_batch_size = sample_batch_size
+        self.base_res = base_res
+        self.superres_factor = superres_factor
 
-    # Data
-    datamodule = CIFAR10DataModule(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
+        self.progress_dir = self.out_dir / "progress"
+        self.progress_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model
-    model = SparseConditioningModule(
-        hidden_size=args.hidden_size,
+        self._fixed_images = None
+        self._fixed_labels = None
+        self._build_fixed_batch()
+
+    def _build_fixed_batch(self):
+        tfm = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        ds = CIFAR10(root=self.data_root, train=False, transform=tfm, download=True)
+        idx = torch.arange(self.sample_batch_size)
+        imgs = [ds[i][0] for i in idx]
+        labels = [ds[i][1] for i in idx]
+
+        self._fixed_images = torch.stack(imgs, dim=0)
+        self._fixed_labels = torch.tensor(labels, dtype=torch.long)
+
+    def _save_grid(self, tensor: torch.Tensor, path: Path, nrow: int = None):
+        x = tensor.detach().cpu()
+        x = (x.clamp(-1.0, 1.0) + 1.0) / 2.0
+        if nrow is None:
+            nrow = x.size(0)
+        save_image(x, str(path), nrow=nrow)
+
+    @torch.no_grad()
+    def _run_sampling(self, trainer, pl_module):
+        if getattr(trainer, "global_rank", 0) != 0:
+            return
+
+        device = pl_module.device
+        B = self.sample_batch_size
+
+        images = self._fixed_images.to(device)
+        labels = self._fixed_labels.to(device)
+
+        was_training = pl_module.training
+        pl_module.eval()
+
+        # 32x32 sparse recon
+        x_latent_32 = pl_module.vae.encode(images)
+        cond_mask_32, target_mask_32 = pl_module._make_sparsity_masks(x_latent_32)
+
+        condition, uncondition = pl_module.conditioner(labels)
+
+        noise_32 = torch.randn_like(x_latent_32)
+        samples_latent_32 = pl_module.diffusion_sampler(
+            pl_module.ema_denoiser,
+            noise_32,
+            condition,
+            uncondition,
+            cond_mask=cond_mask_32,
+            x_cond=x_latent_32,
+        )
+        recon_32 = pl_module.vae.decode(samples_latent_32)
+
+        # 128x128 sparse super-res (1-pixel lift from 32x32 cond)
+        scale = self.superres_factor
+        H_hr = self.base_res * scale
+        W_hr = self.base_res * scale
+
+        cond_mask_128 = torch.zeros((B, 1, H_hr, W_hr), device=device, dtype=x_latent_32.dtype)
+        cond_mask_128[:, :, ::scale, ::scale] = cond_mask_32
+
+        x_cond_128 = torch.zeros((B, x_latent_32.shape[1], H_hr, W_hr), device=device, dtype=x_latent_32.dtype)
+        x_cond_128[:, :, ::scale, ::scale] = x_latent_32
+
+        old_scales = {}
+        for name, net in [("denoiser", pl_module.denoiser), ("ema_denoiser", pl_module.ema_denoiser)]:
+            if hasattr(net, "decoder_patch_scaling_h"):
+                old_scales[name] = (net.decoder_patch_scaling_h, net.decoder_patch_scaling_w)
+                net.decoder_patch_scaling_h = scale
+                net.decoder_patch_scaling_w = scale
+
+        noise_128 = torch.randn_like(x_cond_128)
+        samples_latent_128 = pl_module.diffusion_sampler(
+            pl_module.ema_denoiser,
+            noise_128,
+            condition,
+            uncondition,
+            cond_mask=cond_mask_128,
+            x_cond=x_cond_128,
+        )
+        recon_128 = pl_module.vae.decode(samples_latent_128)
+
+        for name, net in [("denoiser", pl_module.denoiser), ("ema_denoiser", pl_module.ema_denoiser)]:
+            if name in old_scales:
+                h, w = old_scales[name]
+                net.decoder_patch_scaling_h = h
+                net.decoder_patch_scaling_w = w
+
+        step = trainer.global_step
+        tag = f"step_{step:06d}"
+
+        self._save_grid(images, self.progress_dir / f"{tag}_gt32.png")
+        self._save_grid(recon_32, self.progress_dir / f"{tag}_recon32.png")
+        self._save_grid(recon_128, self.progress_dir / f"{tag}_recon128.png")
+
+        if was_training:
+            pl_module.train()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if step > 0 and step % self.sample_every_n_steps == 0:
+            self._run_sampling(trainer, pl_module)
+
+
+def build_model(args):
+    main_scheduler = LinearScheduler()
+
+    vae = PixelAE(scale=1.0)
+    conditioner = LabelConditioner(num_classes=args.num_classes)
+
+    # Build denoiser with Options A/B
+    denoiser = PixNerDiT(
+        in_channels=3,
+        patch_size=args.patch_size,
         num_groups=args.num_groups,
+        hidden_size=args.hidden_size,
+        decoder_hidden_size=args.decoder_hidden_size,
         num_encoder_blocks=args.num_encoder_blocks,
         num_decoder_blocks=args.num_decoder_blocks,
-        decoder_hidden_size=args.decoder_hidden_size,
-        num_classes=10,
-        patch_size=args.patch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
-        sparsity=args.sparsity,
-        cond_fraction=args.cond_fraction,
-        # Options A/B
-        sfc_unified_coords=args.option_a,
-        sfc_spatial_bias=args.option_b,
-        # SFC
+        num_classes=args.num_classes,
+        encoder_type="sfc",
         sfc_curve=args.sfc_curve,
         sfc_group_size=args.sfc_group_size,
         sfc_cross_depth=args.sfc_cross_depth,
         sfc_self_depth=args.sfc_self_depth,
+        # Options A/B
+        sfc_unified_coords=args.option_a,
+        sfc_spatial_bias=args.option_b,
     )
 
-    # Callbacks
-    output_dir = Path(args.output_dir) / args.exp_name
+    sampler = EulerSampler(
+        num_steps=args.num_sample_steps,
+        guidance=args.guidance,
+        guidance_interval_min=0.0,
+        guidance_interval_max=1.0,
+        scheduler=main_scheduler,
+        w_scheduler=LinearScheduler(),
+        guidance_fn=simple_guidance_fn,
+        step_fn=ode_step_fn,
+    )
+
+    trainer = FlowMatchingTrainer(
+        scheduler=main_scheduler,
+        lognorm_t=True,
+        timeshift=1.0,
+    )
+
+    ema_tracker = SimpleEMA(decay=0.9999)
+    optimizer = partial(torch.optim.AdamW, lr=args.lr, weight_decay=0.0)
+
+    model = LightningModel(
+        vae=vae,
+        conditioner=conditioner,
+        denoiser=denoiser,
+        diffusion_trainer=trainer,
+        diffusion_sampler=sampler,
+        ema_tracker=ema_tracker,
+        optimizer=optimizer,
+        lr_scheduler=None,
+        eval_original_model=False,
+        sparsity=args.sparsity,
+        cond_fraction=args.cond_fraction,
+    )
+    return model
+
+
+def build_datamodule(args):
+    train_dataset = PixCIFAR10(root="./data", train=True, random_flip=True, download=True)
+
+    eval_dataset = CIFAR10RandomNDataset(
+        num_classes=args.num_classes,
+        latent_shape=(3, 32, 32),
+        max_num_instances=1000,
+    )
+    pred_dataset = CIFAR10RandomNDataset(
+        num_classes=args.num_classes,
+        latent_shape=(3, 32, 32),
+        max_num_instances=1000,
+    )
+
+    datamodule = DataModule(
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        pred_dataset=pred_dataset,
+        train_batch_size=args.batch_size,
+        train_num_workers=args.num_workers,
+        pred_batch_size=64,
+        pred_num_workers=2,
+    )
+    return datamodule
+
+
+def main():
+    args = parse_args()
+
+    print("=" * 60)
+    print("CIFAR-10 Training with Options A/B")
+    print("=" * 60)
+    print(f"Option A (sfc_unified_coords): {args.option_a}")
+    print(f"Option B (sfc_spatial_bias): {args.option_b}")
+    print(f"Sparsity: {args.sparsity}, Cond Fraction: {args.cond_fraction}")
+    print(f"Config: {vars(args)}")
+    print()
+
+    output_dir = Path(args.output_dir) / f"exp_{args.exp_name}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir}")
+
+    print("\nBuilding model...")
+    model = build_model(args)
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    print("\nBuilding datamodule...")
+    datamodule = build_datamodule(args)
+
+    # Use CSVLogger (no tensorboard)
+    logger = CSVLogger(save_dir=str(output_dir), name="logs")
+
     callbacks = [
         ModelCheckpoint(
             dirpath=output_dir / "checkpoints",
-            filename="step_{step:06d}",
+            every_n_train_steps=args.save_every_n_steps,
             save_top_k=-1,
-            every_n_train_steps=args.sample_every,
+            save_last=True,
         ),
         LearningRateMonitor(logging_interval="step"),
+        SaveImagesHook(save_dir="val", save_compressed=True),
         SparseReconProgressCallback(
-            sample_every=args.sample_every,
-            output_dir=output_dir / "samples",
+            data_root="./data",
+            out_dir=output_dir,
+            sample_every_n_steps=args.sample_every_n_steps,
+            sample_batch_size=args.sample_batch_size,
+            base_res=args.image_size,
+            superres_factor=4,
         ),
     ]
 
-    # Logger
-    logger = TensorBoardLogger(
-        save_dir=output_dir,
-        name="logs",
-    )
-
-    # Trainer
-    trainer = pl.Trainer(
-        accelerator=args.accelerator,
+    trainer = Trainer(
+        default_root_dir=str(output_dir),
+        accelerator="auto",
         devices=args.devices,
         precision=args.precision,
         max_steps=args.max_steps,
-        callbacks=callbacks,
-        logger=logger,
+        check_val_every_n_epoch=args.val_every_n_epochs,
+        num_sanity_val_steps=0,
         log_every_n_steps=50,
-        val_check_interval=args.sample_every,
-        gradient_clip_val=1.0,
+        logger=logger,
+        callbacks=callbacks,
     )
 
-    # Train
-    trainer.fit(model, datamodule)
+    print("\nStarting training...")
+    trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume)
+
+    print("\n" + "=" * 60)
+    print("Training complete!")
+    print(f"Checkpoints saved to: {output_dir / 'checkpoints'}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
