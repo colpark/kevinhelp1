@@ -275,6 +275,9 @@ class PixNerDiT(nn.Module):
         # Ablation flags (Option A and B)
         sfc_unified_coords: bool = False,    # Option A: shared coord embedder for tokens & queries
         sfc_spatial_bias: bool = False,      # Option B: spatial attention bias in cross-attn
+        # Option C and D
+        sfc_attn_temperature: float = 1.0,   # Option C: attention temperature (< 1.0 sharpens)
+        decoder_pixel_coords: bool = False,  # Option D: per-pixel coordinate injection in decoder
     ):
         super().__init__()
 
@@ -294,6 +297,8 @@ class PixNerDiT(nn.Module):
         # Ablation flags
         self.sfc_unified_coords = bool(sfc_unified_coords)
         self.sfc_spatial_bias = bool(sfc_spatial_bias)
+        self.sfc_attn_temperature = float(sfc_attn_temperature)  # Option C
+        self.decoder_pixel_coords = bool(decoder_pixel_coords)    # Option D
 
         # Decoder patch scaling for super-resolution
         self.decoder_patch_scaling_h = 1.0
@@ -363,6 +368,7 @@ class PixNerDiT(nn.Module):
             depth=int(sfc_cross_depth),
             mlp_ratio=4.0,
             use_spatial_bias=self.sfc_spatial_bias,  # Option B
+            attn_temperature=self.sfc_attn_temperature,  # Option C
         )
 
         # NEW: self-attn on sparse SFC tokens (cheap since T is small)
@@ -376,6 +382,17 @@ class PixNerDiT(nn.Module):
             )
             for _ in range(int(sfc_self_depth))
         ])
+
+        # Option D: Per-pixel coordinate injection in decoder
+        if self.decoder_pixel_coords:
+            self.decoder_coord_embed = LearnableFourierMLP(
+                out_features=decoder_hidden_size,
+                n_bands=8,
+                hidden_dim=decoder_hidden_size * 2,
+                mlp_layers=2,
+            )
+        else:
+            self.decoder_coord_embed = None
 
         self.final_layer = NerfFinalLayer(decoder_hidden_size, in_channels)
 
@@ -399,6 +416,7 @@ class PixNerDiT(nn.Module):
         # coord caches (for perceiver and for spatial bias Option B)
         self._coord_cache = {}
         self._patch_query_cache = {}
+        self._decoder_pixel_coord_cache = {}  # Option D
 
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:
@@ -436,6 +454,47 @@ class PixNerDiT(nn.Module):
         coords = torch.stack([xx, yy], dim=-1).view(1, ph * pw, 2)  # (1,L,2)
         self._patch_query_cache[key] = coords
         return coords
+
+    def _fetch_decoder_pixel_coords(self, L: int, patch_h: int, patch_w: int, H_out: int, W_out: int, device, dtype):
+        """
+        Option D: Compute per-pixel (x,y) coordinates for all pixels in decoder patches.
+
+        Each decoder patch has patch_h * patch_w pixels. We compute absolute coordinates
+        in [-1, 1] for each pixel to give the decoder explicit spatial grounding.
+
+        Returns: (L, patch_h*patch_w, 2) coordinates
+        """
+        key = (L, patch_h, patch_w, H_out, W_out, str(device), str(dtype))
+        if key in self._decoder_pixel_coord_cache:
+            return self._decoder_pixel_coord_cache[key]
+
+        # Number of patches in each dimension
+        ph_patches = H_out // patch_h
+        pw_patches = W_out // patch_w
+
+        # Pixel offsets within a single patch (relative to patch top-left)
+        local_y = torch.arange(patch_h, device=device, dtype=dtype)
+        local_x = torch.arange(patch_w, device=device, dtype=dtype)
+        local_yy, local_xx = torch.meshgrid(local_y, local_x, indexing="ij")
+        local_offsets = torch.stack([local_xx, local_yy], dim=-1).view(-1, 2)  # (patch_h*patch_w, 2)
+
+        # Patch top-left corners in pixel space
+        patch_y = torch.arange(ph_patches, device=device, dtype=dtype) * patch_h
+        patch_x = torch.arange(pw_patches, device=device, dtype=dtype) * patch_w
+        patch_yy, patch_xx = torch.meshgrid(patch_y, patch_x, indexing="ij")
+        patch_origins = torch.stack([patch_xx, patch_yy], dim=-1).view(-1, 2)  # (L, 2)
+
+        # Compute absolute pixel coordinates for each patch
+        # patch_origins: (L, 2), local_offsets: (P, 2) where P = patch_h * patch_w
+        # Result: (L, P, 2)
+        pixel_coords = patch_origins.unsqueeze(1) + local_offsets.unsqueeze(0)  # (L, P, 2)
+
+        # Normalize to [-1, 1]
+        pixel_coords[..., 0] = (pixel_coords[..., 0] / max(1.0, float(W_out - 1))) * 2.0 - 1.0
+        pixel_coords[..., 1] = (pixel_coords[..., 1] / max(1.0, float(H_out - 1))) * 2.0 - 1.0
+
+        self._decoder_pixel_coord_cache[key] = pixel_coords
+        return pixel_coords
 
     def initialize_weights(self):
         w = self.s_embedder.proj.weight.data
@@ -724,6 +783,20 @@ class PixNerDiT(nn.Module):
         s_dec = s.view(batch_size * length, self.hidden_size)  # (B*L, D)
 
         x_dec = self.x_embedder(x_dec, decoder_patch_size_h, decoder_patch_size_w)
+
+        # Option D: Per-pixel coordinate injection
+        if self.decoder_pixel_coords and self.decoder_coord_embed is not None:
+            # Get per-pixel coordinates: (L, dp^2, 2)
+            pixel_coords = self._fetch_decoder_pixel_coords(
+                length, decoder_patch_size_h, decoder_patch_size_w, H_out, W_out, device, dtype
+            )
+            # Expand for batch: (L, dp^2, 2) -> (B*L, dp^2, 2)
+            pixel_coords = pixel_coords.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(
+                batch_size * length, decoder_patch_size_h * decoder_patch_size_w, 2
+            )
+            # Embed and add to decoder features
+            coord_embed = self.decoder_coord_embed(pixel_coords)  # (B*L, dp^2, decoder_hidden_size)
+            x_dec = x_dec + coord_embed
 
         for i in range(self.num_decoder_blocks):
             x_dec = self.blocks[i + self.num_encoder_blocks](x_dec, s_dec)

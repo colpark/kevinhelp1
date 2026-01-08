@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-CIFAR-10 Training with Options A/B (Ablation Study)
+CIFAR-10 Training with Options A/B/C/D (Ablation Study)
 
-Based on kevin_pnbase_01072026/train_cifar10.py with Options A/B added.
+Based on kevin_pnbase_01072026/train_cifar10.py with ablation options added.
 
 Option A (sfc_unified_coords): Shared coordinate embedder for tokens & queries
 Option B (sfc_spatial_bias): Spatial attention bias in cross-attention
+Option C (sfc_attn_temperature): Temperature scaling to sharpen attention (< 1.0 sharpens)
+Option D (decoder_pixel_coords): Per-pixel coordinate injection in decoder
 
 Usage:
-    # Both options enabled (default)
+    # Options A+B enabled (default)
     python train_cifar10_options_ab.py --exp_name cifar10_sfc_ab
 
-    # Only Option A
-    python train_cifar10_options_ab.py --exp_name cifar10_sfc_a_only --option_a --no_option_b
+    # Options A+B+C+D (all options)
+    python train_cifar10_options_ab.py --exp_name cifar10_sfc_abcd --option_c --option_d
 
-    # Only Option B
-    python train_cifar10_options_ab.py --exp_name cifar10_sfc_b_only --no_option_a --option_b
+    # Option C only (sharper attention)
+    python train_cifar10_options_ab.py --exp_name cifar10_sfc_c --no_option_a --no_option_b --option_c
 
-    # Neither (baseline, same as kevin_pnbase_01072026)
+    # Option D only (per-pixel coords)
+    python train_cifar10_options_ab.py --exp_name cifar10_sfc_d --no_option_a --no_option_b --option_d
+
+    # Custom temperature (0.3 = very sharp)
+    python train_cifar10_options_ab.py --exp_name cifar10_sfc_sharp --option_c --attn_temperature 0.3
+
+    # Baseline (no options)
     python train_cifar10_options_ab.py --exp_name cifar10_sfc_baseline --no_option_a --no_option_b
 """
 from torchvision.datasets import CIFAR10
@@ -122,6 +130,22 @@ def parse_args():
     parser.add_argument("--no_option_b", dest="option_b", action="store_false",
                         help="Disable Option B")
     parser.set_defaults(option_b=True)
+
+    # Option C: Attention temperature (< 1.0 sharpens attention)
+    parser.add_argument("--option_c", dest="option_c", action="store_true",
+                        help="Enable Option C (sfc_attn_temperature=0.5)")
+    parser.add_argument("--no_option_c", dest="option_c", action="store_false",
+                        help="Disable Option C (temperature=1.0)")
+    parser.set_defaults(option_c=False)
+    parser.add_argument("--attn_temperature", type=float, default=0.5,
+                        help="Attention temperature when Option C is enabled (default: 0.5)")
+
+    # Option D: Per-pixel coordinate injection in decoder
+    parser.add_argument("--option_d", dest="option_d", action="store_true",
+                        help="Enable Option D (decoder_pixel_coords)")
+    parser.add_argument("--no_option_d", dest="option_d", action="store_false",
+                        help="Disable Option D")
+    parser.set_defaults(option_d=False)
 
     return parser.parse_args()
 
@@ -263,7 +287,7 @@ def build_model(args):
     vae = PixelAE(scale=1.0)
     conditioner = LabelConditioner(num_classes=args.num_classes)
 
-    # Build denoiser with Options A/B
+    # Build denoiser with Options A/B/C/D
     denoiser = PixNerDiT(
         in_channels=3,
         patch_size=args.patch_size,
@@ -281,6 +305,9 @@ def build_model(args):
         # Options A/B
         sfc_unified_coords=args.option_a,
         sfc_spatial_bias=args.option_b,
+        # Options C/D
+        sfc_attn_temperature=args.attn_temperature if args.option_c else 1.0,
+        decoder_pixel_coords=args.option_d,
     )
 
     sampler = EulerSampler(
@@ -349,10 +376,12 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print("CIFAR-10 Training with Options A/B")
+    print("CIFAR-10 Training with Options A/B/C/D")
     print("=" * 60)
     print(f"Option A (sfc_unified_coords): {args.option_a}")
     print(f"Option B (sfc_spatial_bias): {args.option_b}")
+    print(f"Option C (sfc_attn_temperature): {args.option_c} (temp={args.attn_temperature if args.option_c else 1.0})")
+    print(f"Option D (decoder_pixel_coords): {args.option_d}")
     print(f"Sparsity: {args.sparsity}, Cond Fraction: {args.cond_fraction}")
     print(f"Config: {vars(args)}")
     print()

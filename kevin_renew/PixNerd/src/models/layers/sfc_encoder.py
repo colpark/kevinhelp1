@@ -505,6 +505,7 @@ class _CrossBlock(nn.Module):
       queries = queries + MLP(LN(queries))
 
     Optionally supports spatial attention bias based on coordinate distances.
+    Option C: Temperature scaling to sharpen/soften attention (temperature < 1.0 sharpens).
     """
     def __init__(
         self,
@@ -514,6 +515,7 @@ class _CrossBlock(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         use_spatial_bias: bool = False,
+        attn_temperature: float = 1.0,  # Option C: temperature for attention sharpening
     ):
         super().__init__()
         self.q_norm = nn.LayerNorm(dim)
@@ -521,6 +523,7 @@ class _CrossBlock(nn.Module):
         self.num_heads = heads
         self.head_dim = dim // heads
         self.use_spatial_bias = use_spatial_bias
+        self.attn_temperature = attn_temperature  # Option C
 
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
@@ -604,7 +607,9 @@ class _CrossBlock(nn.Module):
             v_proj = v_proj.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
             # Attention scores: (B, heads, L, T)
-            attn_scores = torch.matmul(q_proj, k_proj.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # Option C: Apply temperature scaling (temperature < 1.0 sharpens attention)
+            scale = math.sqrt(self.head_dim) * self.attn_temperature
+            attn_scores = torch.matmul(q_proj, k_proj.transpose(-2, -1)) / scale
 
             # Add spatial bias
             spatial_bias = self._compute_spatial_bias(query_coords, token_coords)
@@ -628,8 +633,40 @@ class _CrossBlock(nn.Module):
 
             # Output projection
             attn_out = self.attn.out_proj(attn_out)
+        elif self.attn_temperature != 1.0:
+            # Option C: Manual attention with temperature scaling (no spatial bias)
+            B, L, D = q.shape
+            T = kv.shape[1]
+
+            qkv_weight = self.attn.in_proj_weight
+            qkv_bias = self.attn.in_proj_bias
+
+            q_proj = nn.functional.linear(q, qkv_weight[:D], qkv_bias[:D] if qkv_bias is not None else None)
+            k_proj = nn.functional.linear(kv, qkv_weight[D:2*D], qkv_bias[D:2*D] if qkv_bias is not None else None)
+            v_proj = nn.functional.linear(kv, qkv_weight[2*D:], qkv_bias[2*D:] if qkv_bias is not None else None)
+
+            q_proj = q_proj.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+            k_proj = k_proj.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+            v_proj = v_proj.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+            # Apply temperature scaling
+            scale = math.sqrt(self.head_dim) * self.attn_temperature
+            attn_scores = torch.matmul(q_proj, k_proj.transpose(-2, -1)) / scale
+
+            if key_padding_mask is not None:
+                attn_scores = attn_scores.masked_fill(
+                    key_padding_mask.unsqueeze(1).unsqueeze(2),
+                    float('-inf')
+                )
+
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attn.dropout, training=self.training)
+
+            attn_out = torch.matmul(attn_weights, v_proj)
+            attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+            attn_out = self.attn.out_proj(attn_out)
         else:
-            # Standard attention without spatial bias
+            # Standard attention without spatial bias (temperature=1.0)
             attn_out, _ = self.attn(
                 q, kv, kv,
                 key_padding_mask=key_padding_mask,
@@ -656,6 +693,8 @@ class SFCQueryCrossEncoder(nn.Module):
       token_coords: (B,T,2) optional, for spatial bias
     Output:
       (B,L,D)
+
+    Option C: attn_temperature < 1.0 sharpens attention, > 1.0 softens.
     """
     def __init__(
         self,
@@ -666,9 +705,11 @@ class SFCQueryCrossEncoder(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         use_spatial_bias: bool = False,
+        attn_temperature: float = 1.0,  # Option C
     ):
         super().__init__()
         self.use_spatial_bias = use_spatial_bias
+        self.attn_temperature = attn_temperature
         self.blocks = nn.ModuleList([
             _CrossBlock(
                 dim=dim,
@@ -677,6 +718,7 @@ class SFCQueryCrossEncoder(nn.Module):
                 attn_drop=attn_drop,
                 proj_drop=proj_drop,
                 use_spatial_bias=use_spatial_bias,
+                attn_temperature=attn_temperature,  # Option C
             )
             for _ in range(int(depth))
         ])
