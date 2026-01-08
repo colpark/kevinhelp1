@@ -168,11 +168,55 @@ class SparseConditioningModule(pl.LightningModule):
             timeshift=1.0,
         )
 
-    def generate_sparse_mask(self, batch_size, height, width, device):
-        """Generate random sparse conditioning mask."""
-        mask = torch.rand(batch_size, 1, height, width, device=device)
-        mask = (mask < self.sparsity).float()
-        return mask
+    def generate_sparsity_masks(self, batch_size, height, width, device, dtype=torch.float32):
+        """
+        Generate disjoint cond_mask and target_mask.
+
+        With sparsity=0.4 and cond_fraction=0.5:
+          - 40% of pixels are "observed"
+          - 20% go to cond_mask (hints given to model)
+          - 20% go to target_mask (where loss is computed)
+          - 60% are unobserved (not in either mask)
+
+        Returns:
+            cond_mask: (B,1,H,W) float, 1=hint pixel
+            target_mask: (B,1,H,W) float, 1=compute loss here
+        """
+        B, H, W = batch_size, height, width
+        total = H * W
+
+        # Total observed pixels
+        k_obs = int(round(self.sparsity * total))
+        k_obs = max(0, min(total, k_obs))
+
+        if k_obs == 0:
+            cond_mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+            target_mask = torch.zeros_like(cond_mask)
+            return cond_mask, target_mask
+
+        # Split observed into cond and target
+        k_cond = int(round(self.cond_fraction * k_obs))
+        k_cond = max(0, min(k_obs, k_cond))
+        k_target = k_obs - k_cond
+
+        cond_mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+        target_mask = torch.zeros_like(cond_mask)
+
+        flat_idx = torch.arange(total, device=device)
+
+        for b in range(B):
+            perm = flat_idx[torch.randperm(total, device=device)]
+            obs_idx = perm[:k_obs]
+
+            if k_cond > 0:
+                cond_idx = obs_idx[:k_cond]
+                cond_mask[b].view(-1)[cond_idx] = 1.0
+
+            if k_target > 0:
+                target_idx = obs_idx[k_cond:k_cond + k_target]
+                target_mask[b].view(-1)[target_idx] = 1.0
+
+        return cond_mask, target_mask
 
     def forward(self, x, t, y, cond_mask=None, **kwargs):
         return self.model(x, t, y, cond_mask=cond_mask, **kwargs)
@@ -182,19 +226,20 @@ class SparseConditioningModule(pl.LightningModule):
         B, C, H, W = images.shape
         device = images.device
 
-        # Decide whether to use conditioning for this batch
-        use_cond = torch.rand(1).item() < self.cond_fraction
-
-        if use_cond:
-            cond_mask = self.generate_sparse_mask(B, H, W, device)
-        else:
-            cond_mask = None
+        # Generate disjoint cond and target masks
+        # With sparsity=0.4, cond_fraction=0.5:
+        #   - cond_mask: 20% of pixels (hints)
+        #   - target_mask: 20% of pixels (loss computed here)
+        #   - remaining 60%: unobserved
+        cond_mask, target_mask = self.generate_sparsity_masks(B, H, W, device, images.dtype)
 
         # Flow matching training step
+        # - cond_mask pixels are clamped to clean GT in x_t
+        # - loss is computed ONLY on target_mask pixels
         loss = self.diffusion_trainer.training_step(
             self.model, images, labels,
             cond_mask=cond_mask,
-            target_mask=cond_mask,  # Optionally mask loss at hint locations
+            target_mask=target_mask,
         )
 
         self.log("train/loss", loss, prog_bar=True)
@@ -205,11 +250,12 @@ class SparseConditioningModule(pl.LightningModule):
         B, C, H, W = images.shape
         device = images.device
 
-        # Compute validation loss with conditioning
-        cond_mask = self.generate_sparse_mask(B, H, W, device)
+        # Same mask generation for validation
+        cond_mask, target_mask = self.generate_sparsity_masks(B, H, W, device, images.dtype)
         loss = self.diffusion_trainer.training_step(
             self.model, images, labels,
             cond_mask=cond_mask,
+            target_mask=target_mask,
         )
 
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
@@ -298,8 +344,9 @@ class SparseReconProgressCallback(Callback):
 
         B, C, H, W = images.shape
 
-        # Generate sparse mask
-        cond_mask = pl_module.generate_sparse_mask(B, H, W, device)
+        # For inference/visualization, we use cond_mask as hints
+        # (we don't need target_mask for sampling, only for training)
+        cond_mask, _ = pl_module.generate_sparsity_masks(B, H, W, device, images.dtype)
         x_cond = images  # Use original images as conditioning values
 
         # ============================================================
