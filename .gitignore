@@ -1,5 +1,5 @@
 
-# Reference implementation exclusions
+# Reference implementation exclusions (original without Options A/B)
 kevin_pnbase_01072026/data/
 kevin_pnbase_01072026/outputs/
 kevin_pnbase_01072026/.git/
@@ -12,3 +12,17 @@ kevin_pnbase_01072026/PixNerd/.idea/
 kevin_pnbase_01072026/PixNerd/src.zip
 kevin_pnbase_01072026/**/__pycache__/
 kevin_pnbase_01072026/**/*.pyc
+
+# Renewed implementation exclusions (with Options A/B)
+kevin_renew/data/
+kevin_renew/outputs/
+kevin_renew/.git/
+kevin_renew/.ipynb_checkpoints/
+kevin_renew/PixNerd/workdirs/
+kevin_renew/PixNerd/outputs/
+kevin_renew/PixNerd/data/
+kevin_renew/PixNerd/figs/
+kevin_renew/PixNerd/.idea/
+kevin_renew/PixNerd/src.zip
+kevin_renew/**/__pycache__/
+kevin_renew/**/*.pyc
