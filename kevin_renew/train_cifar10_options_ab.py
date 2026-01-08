@@ -43,7 +43,7 @@ from src.models.transformer.pixnerd_c2i_heavydecoder import PixNerDiT
 from src.diffusion.flow_matching.training import FlowMatchingTrainer
 from src.diffusion.flow_matching.sampling import EulerSampler
 from src.diffusion.flow_matching.scheduling import LinearScheduler
-from src.diffusion.base.guidance import cfg_guidance
+from src.diffusion.base.guidance import simple_guidance_fn
 
 
 class CIFAR10DataModule(pl.LightningDataModule):
@@ -164,7 +164,7 @@ class SparseConditioningModule(pl.LightningModule):
             w_scheduler=None,
             num_steps=50,
             guidance=4.0,
-            guidance_fn=cfg_guidance,
+            guidance_fn=simple_guidance_fn,
             timeshift=1.0,
         )
 
@@ -323,7 +323,7 @@ class SparseConditioningModule(pl.LightningModule):
             w_scheduler=None,
             num_steps=num_steps,
             guidance=guidance,
-            guidance_fn=cfg_guidance,
+            guidance_fn=simple_guidance_fn,
             timeshift=1.0,
         )
 
@@ -396,7 +396,7 @@ class SparseReconProgressCallback(Callback):
             w_scheduler=None,
             num_steps=50,
             guidance=4.0,
-            guidance_fn=cfg_guidance,
+            guidance_fn=simple_guidance_fn,
             timeshift=1.0,
         )
 
