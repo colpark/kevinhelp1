@@ -204,31 +204,61 @@ PIXNERD (Grid):                    SFC (Ours):
 - **Efficient representation**: No tokens wasted on unobserved regions
 - **Variable sparsity**: Works with any observation pattern
 
-### Difference 2: Cross-Attention Instead of Self-Attention for Sparse→Dense
+### Difference 2: Cross-Attention ADDED for Sparse→Dense Information Injection
+
+**Important clarification**: Cross-attention does NOT replace self-attention. It is ADDED as an additional stage before the same self-attention blocks used in PixNerd.
 
 ```
-PIXNERD:                           SFC (Ours):
-┌─────────────────┐               ┌─────────────────┐
-│  Self-Attention │               │ Cross-Attention │
-│                 │               │                 │
-│  P₁ ←→ P₂       │               │  Q₁ ← T₁,T₂,T₃  │
-│   ↕     ↕       │               │  Q₂ ← T₁,T₂,T₃  │
-│  P₃ ←→ P₄       │               │  ...            │
-│                 │               │                 │
-│  All patches    │               │ Queries: patches│
-│  attend to all  │               │ Keys: sparse    │
-│                 │               │       tokens    │
-└─────────────────┘               └─────────────────┘
+PIXNERD (Grid Encoder):            SFC (Ours):
 
-P = patch tokens                   Q = query (patch center)
+                                   ┌─────────────────┐
+                                   │ Token Self-Attn │  ← Sparse tokens
+                                   │   (2 blocks)    │     refine each other
+                                   └────────┬────────┘
+                                            │
+                                            ▼
+                                   ┌─────────────────┐
+                                   │ Cross-Attention │  ← NEW: Inject sparse
+                                   │   (2 blocks)    │     info into queries
+                                   │  Q₁ ← T₁,T₂,T₃  │
+                                   │  Q₂ ← T₁,T₂,T₃  │
+                                   └────────┬────────┘
+                                            │
+┌─────────────────┐               ┌─────────▼─────────┐
+│  Self-Attention │               │  Self-Attention   │  ← SAME as PixNerd!
+│   (8 blocks)    │               │    (8 blocks)     │
+│                 │               │                   │
+│  P₁ ←→ P₂       │               │  P₁ ←→ P₂         │
+│   ↕     ↕       │               │   ↕     ↕         │
+│  P₃ ←→ P₄       │               │  P₃ ←→ P₄         │
+│                 │               │                   │
+│  All patches    │               │  All patches      │
+│  attend to all  │               │  attend to all    │
+└─────────────────┘               └───────────────────┘
+
+P = patch tokens                   Q = query (becomes patch after cross-attn)
                                    T = sparse SFC tokens
 ```
 
-**What it enables:**
-- **Direct information flow**: Observed pixels directly inform output queries
-- **No dilution**: Information doesn't pass through unobserved patches
-- **Asymmetric roles**: Queries (where to generate) vs Keys (what we observed)
-- **Scalability**: T tokens << N pixels, efficient for sparse conditioning
+**The key insight**: Patches DO attend to each other in 8 DiT blocks (same as PixNerd).
+The cross-attention is an ADDITIONAL stage that injects sparse conditioning information
+before the patches refine through self-attention.
+
+```python
+# From pixnerd_c2i_heavydecoder.py, lines 735-738:
+# 5) SAME AdaLN+RoPE DiT blocks  ← Comment says "SAME"!
+xpos = self.fetch_pos(ph, pw, device)
+for i in range(self.num_encoder_blocks):  # 8 blocks with SELF-ATTENTION
+    s = self.blocks[i](s, condition, xpos)
+```
+
+**What this architecture enables:**
+- **Direct sparse→dense injection**: Observed pixels directly inform patches via cross-attention
+- **Preserved patch-to-patch communication**: Self-attention lets patches refine together
+- **Two-stage information flow**:
+  1. Cross-attn: "What did we observe?" (sparse → dense)
+  2. Self-attn: "How do observations relate globally?" (dense ↔ dense)
+- **Best of both worlds**: Sparse efficiency + full patch interaction
 
 ### Difference 3: Option A - Unified Coordinate Space
 
