@@ -42,7 +42,7 @@ import numpy as np
 from src.models.transformer.pixnerd_c2i_heavydecoder import PixNerDiT
 from src.diffusion.flow_matching.training import FlowMatchingTrainer
 from src.diffusion.flow_matching.sampling import EulerSampler
-from src.diffusion.base.scheduling import CosineScheduler
+from src.diffusion.flow_matching.scheduling import LinearScheduler
 from src.diffusion.base.guidance import cfg_guidance
 
 
@@ -155,7 +155,7 @@ class SparseConditioningModule(pl.LightningModule):
         )
 
         # Flow matching trainer
-        scheduler = CosineScheduler()
+        scheduler = LinearScheduler()
         self.diffusion_trainer = FlowMatchingTrainer(scheduler=scheduler)
 
         # Sampler for validation
@@ -233,15 +233,25 @@ class SparseConditioningModule(pl.LightningModule):
         #   - remaining 60%: unobserved
         cond_mask, target_mask = self.generate_sparsity_masks(B, H, W, device, images.dtype)
 
-        # Flow matching training step
+        # Null labels for CFG training (drop conditioning with probability from trainer)
+        null_labels = torch.full_like(labels, self.model.num_classes)
+
+        # Flow matching training step via BaseTrainer.__call__
         # - cond_mask pixels are clamped to clean GT in x_t
         # - loss is computed ONLY on target_mask pixels
-        loss = self.diffusion_trainer.training_step(
-            self.model, images, labels,
+        loss_dict = self.diffusion_trainer(
+            net=self.model,
+            ema_net=self.model,  # not using separate EMA in this trainer
+            solver=self.sampler,  # not used in FM training, but part of interface
+            x=images,
+            condition=labels,
+            uncondition=null_labels,
+            metadata=None,
             cond_mask=cond_mask,
             target_mask=target_mask,
         )
 
+        loss = loss_dict["loss"]
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
@@ -252,12 +262,23 @@ class SparseConditioningModule(pl.LightningModule):
 
         # Same mask generation for validation
         cond_mask, target_mask = self.generate_sparsity_masks(B, H, W, device, images.dtype)
-        loss = self.diffusion_trainer.training_step(
-            self.model, images, labels,
+
+        # Null labels for CFG
+        null_labels = torch.full_like(labels, self.model.num_classes)
+
+        loss_dict = self.diffusion_trainer(
+            net=self.model,
+            ema_net=self.model,
+            solver=self.sampler,
+            x=images,
+            condition=labels,
+            uncondition=null_labels,
+            metadata=None,
             cond_mask=cond_mask,
             target_mask=target_mask,
         )
 
+        loss = loss_dict["loss"]
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
